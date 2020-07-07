@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
+	"math/rand"
 	"net"
 	"strings"
 	"sync"
@@ -48,6 +50,9 @@ type FailoverOptions struct {
 	IdleCheckFrequency time.Duration
 
 	TLSConfig *tls.Config
+
+	// Enables read-only commands on slave nodes.
+	ReadOnly bool
 }
 
 func (opt *FailoverOptions) options() *Options {
@@ -75,6 +80,8 @@ func (opt *FailoverOptions) options() *Options {
 		MaxConnAge:         opt.MaxConnAge,
 
 		TLSConfig: opt.TLSConfig,
+
+		sentinelReadOnly: opt.ReadOnly,
 	}
 }
 
@@ -321,7 +328,15 @@ func (c *sentinelFailover) Pool() *pool.ConnPool {
 }
 
 func (c *sentinelFailover) dial(ctx context.Context, network, _ string) (net.Conn, error) {
-	addr, err := c.MasterAddr(ctx)
+	var addr string
+	var err error
+	fmt.Println(network)
+	if c.opt.sentinelReadOnly {
+		addr, err = c.RandomSlaveAddr(ctx)
+	} else {
+		addr, err = c.MasterAddr(ctx)
+	}
+	// addr, err := c.MasterAddr(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -496,4 +511,124 @@ func contains(slice []string, str string) bool {
 		}
 	}
 	return false
+}
+
+func (c *sentinelFailover) RandomSlaveAddr(ctx context.Context) (string, error) {
+	addresses, err := c.slaveAddresses(ctx)
+	if err != nil {
+		return "", err
+	}
+	if len(addresses) < 1 {
+		return c.MasterAddr(ctx)
+	}
+	return addresses[rand.Intn(len(addresses))], nil
+}
+
+func (c *sentinelFailover) slaveAddresses(ctx context.Context) ([]string, error) {
+	c.mu.RLock()
+	sentinel := c.sentinel
+	c.mu.RUnlock()
+
+	if sentinel != nil {
+		addrs := c.getSlaveAddrs(ctx, sentinel)
+		if len(addrs) > 0 {
+			return addrs, nil
+		}
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.sentinel != nil {
+		addrs := c.getSlaveAddrs(ctx, c.sentinel)
+		if len(addrs) > 0 {
+			return addrs, nil
+		}
+		_ = c.closeSentinel()
+	}
+
+	for i, sentinelAddr := range c.sentinelAddrs {
+		sentinel := NewSentinelClient(&Options{
+			Addr:   sentinelAddr,
+			Dialer: c.opt.Dialer,
+
+			Password: c.password,
+
+			MaxRetries: c.opt.MaxRetries,
+
+			DialTimeout:  c.opt.DialTimeout,
+			ReadTimeout:  c.opt.ReadTimeout,
+			WriteTimeout: c.opt.WriteTimeout,
+
+			PoolSize:           c.opt.PoolSize,
+			PoolTimeout:        c.opt.PoolTimeout,
+			IdleTimeout:        c.opt.IdleTimeout,
+			IdleCheckFrequency: c.opt.IdleCheckFrequency,
+
+			TLSConfig: c.opt.TLSConfig,
+		})
+
+		slaves, err := sentinel.Slaves(ctx, c.masterName).Result()
+		if err != nil {
+			internal.Logger.Printf("sentinel: Slaves master=%q failed: %s",
+				c.masterName, err)
+			_ = sentinel.Close()
+			continue
+		}
+
+		// Push working sentinel to the top.
+		c.sentinelAddrs[0], c.sentinelAddrs[i] = c.sentinelAddrs[i], c.sentinelAddrs[0]
+		c.setSentinel(ctx, sentinel)
+
+		addrs := parseSlaveAddresses(slaves)
+		return addrs, nil
+	}
+
+	return []string{}, errors.New("redis: all sentinels are unreachable")
+}
+
+func (c *sentinelFailover) getSlaveAddrs(ctx context.Context, sentinel *SentinelClient) []string {
+	addrs, err := sentinel.Slaves(ctx, c.masterName).Result()
+	if err != nil {
+		internal.Logger.Printf("sentinel: Slaves name=%q failed: %s",
+			c.masterName, err)
+		return []string{}
+	}
+
+	return parseSlaveAddresses(addrs)
+}
+
+func parseSlaveAddresses(addrs []interface{}) []string {
+	nodes := []string{}
+
+	for _, node := range addrs {
+		ip := ""
+		port := ""
+		flags := []string{}
+		lastkey := ""
+		isDown := false
+
+		for _, key := range node.([]interface{}) {
+			switch lastkey {
+			case "ip":
+				ip = key.(string)
+			case "port":
+				port = key.(string)
+			case "flags":
+				flags = strings.Split(key.(string), ",")
+			}
+			lastkey = key.(string)
+		}
+		for _, flag := range flags {
+			switch flag {
+			case "s_down", "o_down", "disconnected":
+				isDown = true
+			}
+		}
+		if !isDown {
+			nodes = append(nodes, net.JoinHostPort(ip, port))
+		}
+	}
+
+	return nodes
 }

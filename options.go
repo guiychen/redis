@@ -100,6 +100,9 @@ type Options struct {
 
 	// Limiter interface used to implemented circuit breaker or rate limiter.
 	Limiter Limiter
+
+	// Enables read only queries on redis replicas in sentinel mode
+	sentinelReadOnly bool
 }
 
 func (opt *Options) init() {
